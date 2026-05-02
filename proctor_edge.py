@@ -1,13 +1,16 @@
 import argparse
+import asyncio
 import csv
 import json
 import math
 import os
 import platform
+import queue
 import shutil
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import TextIOWrapper
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -18,6 +21,26 @@ import cv2
 import numpy as np
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from ultralytics import YOLO
+
+# ---------------------------------------------------------------------------
+# Optional: aiortc (WebRTC video streaming) + websockets (Supabase Realtime)
+# Install with:  pip install aiortc websockets
+# If not installed the script still works – live video streaming is disabled.
+# ---------------------------------------------------------------------------
+try:
+    from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+    from aiortc.contrib.media import MediaBlackhole
+    import fractions
+    import av
+    AIORTC_AVAILABLE = True
+except ImportError:
+    AIORTC_AVAILABLE = False
+
+try:
+    import websockets
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    WEBSOCKETS_AVAILABLE = False
 
 try:
     import torch
@@ -114,6 +137,11 @@ class RuntimeConfig:
     camera_fps: int
     status_every_frames: int
     frame_fit: str
+    # --- GuardEye Supabase integration (NEW) ---
+    supabase_url: Optional[str] = None       # e.g. https://xxxx.supabase.co
+    supabase_anon_key: Optional[str] = None  # project anon/public key
+    session_id: Optional[str] = None         # GuardEye session UUID
+    webrtc_enabled: bool = False             # stream annotated video via WebRTC
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -251,6 +279,23 @@ def parse_args() -> RuntimeConfig:
     parser.add_argument("--show-window", action="store_true")
     parser.add_argument("--status-every-frames", type=int, default=30)
     parser.add_argument("--frame-fit", choices=["stretch", "contain", "cover"], default="stretch")
+    # --- GuardEye Supabase integration (NEW) ---
+    parser.add_argument(
+        "--supabase-url", default=os.environ.get("SUPABASE_URL"),
+        help="Supabase project URL, e.g. https://xxxx.supabase.co  (or set SUPABASE_URL env var)",
+    )
+    parser.add_argument(
+        "--supabase-anon-key", default=os.environ.get("SUPABASE_ANON_KEY"),
+        help="Supabase anon/public API key  (or set SUPABASE_ANON_KEY env var)",
+    )
+    parser.add_argument(
+        "--session-id", default=None,
+        help="GuardEye session UUID shown in the dashboard URL",
+    )
+    parser.add_argument(
+        "--webrtc", action="store_true",
+        help="Stream annotated video to GuardEye via WebRTC (requires aiortc + websockets)",
+    )
 
     args = parser.parse_args()
 
@@ -324,6 +369,11 @@ def parse_args() -> RuntimeConfig:
         camera_fps=camera_fps,
         status_every_frames=status_every_frames,
         frame_fit=frame_fit,
+        # --- GuardEye Supabase integration (NEW) ---
+        supabase_url=args.supabase_url,
+        supabase_anon_key=args.supabase_anon_key,
+        session_id=args.session_id,
+        webrtc_enabled=bool(args.webrtc),
     )
 
 
@@ -642,6 +692,7 @@ def log_event(
 
 
 def post_alert(endpoint: Optional[str], payload: Dict[str, Any]) -> None:
+    """Legacy plain-HTTP alert endpoint (kept for backwards compatibility)."""
     if not endpoint:
         return
     body = json.dumps(payload).encode("utf-8")
@@ -656,6 +707,257 @@ def post_alert(endpoint: Optional[str], payload: Dict[str, Any]) -> None:
             pass
     except (URLError, TimeoutError, OSError) as exc:
         print(f"Alert POST failed: {exc}")
+
+
+def post_alert_supabase(cfg: "RuntimeConfig", payload: Dict[str, Any]) -> None:
+    """
+    POST a risk alert directly into the GuardEye Supabase `alerts` table.
+
+    Maps proctor_edge fields → Supabase column names exactly as defined in
+    guardeye/supabase_schema.sql so the LiveMonitoring dashboard picks them
+    up immediately on its 5-second poll.
+
+    Requires --supabase-url, --supabase-anon-key, and --session-id to be set.
+    Falls back silently if any of those are missing.
+    """
+    if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
+        return
+
+    student_id = str(payload.get("student_id", ""))
+    row = {
+        # user_id is resolved server-side via RLS / service role when using
+        # the anon key + a session token.  We omit it here and rely on the
+        # Supabase policy that allows insert when session_id matches.
+        # If you use a service-role key instead, add "user_id": "<uuid>" here.
+        "session_id": cfg.session_id,
+        "studentId": student_id,
+        "studentName": f"Student {student_id}",
+        "behaviorType": payload.get("event_type", "alert_high_risk_triggered"),
+        "riskScore": payload.get("risk_score", 0.0),
+        "headStatus": payload.get("head_status", None),
+        "alertThreshold": payload.get("alert_threshold", cfg.alert_threshold),
+        "frameIndex": payload.get("frame_index", None),
+        "details": payload.get("details", None),
+        "frameUrl": None,  # future: upload snapshot image URL here
+    }
+
+    url = f"{cfg.supabase_url.rstrip('/')}/rest/v1/alerts"
+    body = json.dumps(row).encode("utf-8")
+    req = Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "apikey": cfg.supabase_anon_key,
+            "Authorization": f"Bearer {cfg.supabase_anon_key}",
+            "Prefer": "return=minimal",  # don't return the inserted row (faster)
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=3.0):
+            pass
+    except (URLError, TimeoutError, OSError) as exc:
+        print(f"Supabase alert POST failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# WebRTC live video streaming (NEW)
+# ---------------------------------------------------------------------------
+
+if AIORTC_AVAILABLE:
+    class AnnotatedFrameTrack(VideoStreamTrack):
+        """
+        An aiortc VideoStreamTrack that pulls annotated BGR frames from a
+        thread-safe queue and emits them as H.264-compatible video frames.
+
+        The main capture loop pushes frames into `frame_queue` every iteration.
+        The WebRTC event loop reads from it asynchronously via recv().
+        """
+
+        kind = "video"
+
+        def __init__(self, frame_queue: "queue.Queue[np.ndarray]", fps: float) -> None:
+            super().__init__()
+            self._queue = frame_queue
+            self._fps = max(1.0, fps)
+            self._pts = 0
+            self._time_base = fractions.Fraction(1, 90000)
+
+        async def recv(self) -> "av.VideoFrame":
+            # Block briefly waiting for a frame; yield to event loop if empty.
+            loop = asyncio.get_event_loop()
+            bgr: Optional[np.ndarray] = None
+            while bgr is None:
+                try:
+                    bgr = await loop.run_in_executor(None, self._queue.get, True, 0.05)
+                except queue.Empty:
+                    await asyncio.sleep(0.01)
+
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+            pts_increment = int(90000 / self._fps)
+            video_frame.pts = self._pts
+            video_frame.time_base = self._time_base
+            self._pts += pts_increment
+            return video_frame
+
+
+async def _run_webrtc_sender(
+    cfg: "RuntimeConfig",
+    frame_queue: "queue.Queue[np.ndarray]",
+    stop_event: threading.Event,
+) -> None:
+    """
+    Async coroutine that:
+      1. Connects to the Supabase Realtime WebSocket for channel `webrtc_{session_id}`.
+      2. Waits for an SDP `offer` broadcast from the GuardEye browser.
+      3. Creates an RTCPeerConnection, attaches the AnnotatedFrameTrack, and
+         sends back an SDP `answer`.
+      4. Handles ICE candidate exchange.
+      5. Keeps running until `stop_event` is set.
+
+    The channel and message format exactly mirror LiveMonitoring.tsx in guardeye.
+    """
+    if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
+        print("[WebRTC] Missing --supabase-url / --supabase-anon-key / --session-id. Skipping.")
+        return
+
+    # Supabase Realtime WebSocket endpoint
+    realtime_ws_url = (
+        cfg.supabase_url.rstrip("/")
+        .replace("https://", "wss://")
+        .replace("http://", "ws://")
+        + f"/realtime/v1/websocket?apikey={cfg.supabase_anon_key}&vsn=1.0.0"
+    )
+
+    channel_topic = f"realtime:webrtc_{cfg.session_id}"
+    pc: Optional[RTCPeerConnection] = None
+    track: Optional["AnnotatedFrameTrack"] = None
+    fps = cfg.camera_fps
+
+    print(f"[WebRTC] Connecting to Supabase Realtime channel webrtc_{cfg.session_id} …")
+
+    try:
+        async with websockets.connect(realtime_ws_url) as ws:
+            # Join the Realtime channel
+            join_msg = json.dumps({
+                "topic": channel_topic,
+                "event": "phx_join",
+                "payload": {},
+                "ref": "1",
+            })
+            await ws.send(join_msg)
+            print("[WebRTC] Joined Realtime channel. Waiting for browser offer…")
+
+            async def send_broadcast(event: str, payload: Dict[str, Any]) -> None:
+                msg = json.dumps({
+                    "topic": channel_topic,
+                    "event": "broadcast",
+                    "payload": {"type": "broadcast", "event": event, "payload": payload},
+                    "ref": None,
+                })
+                await ws.send(msg)
+
+            async for raw in ws:
+                if stop_event.is_set():
+                    break
+
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                event = msg.get("event")
+                payload = msg.get("payload", {})
+
+                # Unwrap Supabase broadcast envelope
+                if event == "broadcast":
+                    inner_event = payload.get("event")
+                    inner_payload = payload.get("payload", {})
+
+                    if inner_event == "offer" and pc is None:
+                        print("[WebRTC] Received offer from browser. Creating peer connection…")
+                        pc = RTCPeerConnection()
+                        track = AnnotatedFrameTrack(frame_queue, fps)
+                        pc.addTrack(track)
+
+                        @pc.on("icecandidate")
+                        async def on_ice(candidate: Any) -> None:
+                            if candidate:
+                                await send_broadcast("candidate", {"candidate": {
+                                    "candidate": candidate.candidate,
+                                    "sdpMid": candidate.sdpMid,
+                                    "sdpMLineIndex": candidate.sdpMLineIndex,
+                                }})
+
+                        offer_sdp = RTCSessionDescription(
+                            sdp=inner_payload["offer"]["sdp"],
+                            type=inner_payload["offer"]["type"],
+                        )
+                        await pc.setRemoteDescription(offer_sdp)
+                        answer = await pc.createAnswer()
+                        await pc.setLocalDescription(answer)
+                        await send_broadcast("answer", {"answer": {
+                            "sdp": pc.localDescription.sdp,
+                            "type": pc.localDescription.type,
+                        }})
+                        print("[WebRTC] Sent answer. Streaming video…")
+
+                    elif inner_event == "candidate" and pc is not None:
+                        cand_data = inner_payload.get("candidate", {})
+                        if cand_data.get("candidate"):
+                            from aiortc import RTCIceCandidate
+                            candidate = RTCIceCandidate(
+                                foundation="",
+                                component=1,
+                                protocol="udp",
+                                priority=0,
+                                host="",
+                                port=0,
+                                type="host",
+                                sdpMid=cand_data.get("sdpMid"),
+                                sdpMLineIndex=cand_data.get("sdpMLineIndex"),
+                            )
+                            # Pass the raw candidate string via the sdp attribute
+                            candidate.sdp = cand_data["candidate"]
+                            await pc.addIceCandidate(candidate)
+
+    except Exception as exc:
+        print(f"[WebRTC] Connection error: {exc}")
+    finally:
+        if pc is not None:
+            await pc.close()
+        print("[WebRTC] Peer connection closed.")
+
+
+def start_webrtc_thread(
+    cfg: "RuntimeConfig",
+    frame_queue: "queue.Queue[np.ndarray]",
+    stop_event: threading.Event,
+) -> Optional[threading.Thread]:
+    """
+    Starts the WebRTC sender in a dedicated asyncio thread so it doesn't block
+    the OpenCV capture loop.  Returns the thread so main() can join it on exit.
+    """
+    if not AIORTC_AVAILABLE:
+        print("[WebRTC] aiortc not installed — live video streaming disabled.")
+        print("         Install with:  pip install aiortc websockets")
+        return None
+    if not WEBSOCKETS_AVAILABLE:
+        print("[WebRTC] websockets not installed — live video streaming disabled.")
+        print("         Install with:  pip install websockets")
+        return None
+
+    def _thread_target() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_run_webrtc_sender(cfg, frame_queue, stop_event))
+        loop.close()
+
+    t = threading.Thread(target=_thread_target, daemon=True, name="webrtc-sender")
+    t.start()
+    return t
 
 
 def xyxy_to_ltwh(xyxy: Tuple[float, float, float, float]) -> List[float]:
@@ -1089,8 +1391,12 @@ def handle_events_and_alerts(
                     "timestamp_ms": ts_ms,
                     "timestamp_iso": ts_iso,
                     "source": cfg.source_raw,
+                    # NEW: include head_status and details for Supabase mapping
+                    "head_status": current_head,
+                    "details": f"head={current_head} contraband={info.get('contraband_risk', 0.0):.2f}",
                 }
                 post_alert(cfg.alert_endpoint, payload)
+                post_alert_supabase(cfg, payload)  # NEW: direct Supabase insert
                 hist["last_alert_ms"] = ts_ms
 
             hist["above_threshold"] = True
@@ -1215,6 +1521,13 @@ def main() -> None:
     contraband_cache: List[Dict[str, Any]] = []
     student_history: Dict[int, Dict[str, Any]] = {}
 
+    # --- WebRTC live video (NEW) ---
+    webrtc_stop = threading.Event()
+    frame_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)  # 2-frame buffer
+    webrtc_thread: Optional[threading.Thread] = None
+    if cfg.webrtc_enabled:
+        webrtc_thread = start_webrtc_thread(cfg, frame_queue, webrtc_stop)
+
     try:
         while True:
             ok, frame = cap.read()
@@ -1241,6 +1554,14 @@ def main() -> None:
             maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir)
             handle_events_and_alerts(frame_index, tracked_students, student_history, event_log, cfg)
 
+            # --- Push annotated frame to WebRTC sender (NEW) ---
+            if cfg.webrtc_enabled and webrtc_thread is not None:
+                try:
+                    # Non-blocking put; drop frame if consumer is behind (avoids blocking capture)
+                    frame_queue.put_nowait(annotated.copy())
+                except queue.Full:
+                    pass
+
             if cfg.headless and (frame_index % cfg.status_every_frames == 0):
                 student_count = len(tracked_students)
                 max_risk = max((float(s["risk"]) for s in tracked_students.values()), default=0.0)
@@ -1265,6 +1586,11 @@ def main() -> None:
             writer.release()
         close_event_log(event_log)
         cv2.destroyAllWindows()
+        # --- Stop WebRTC thread (NEW) ---
+        if cfg.webrtc_enabled:
+            webrtc_stop.set()
+            if webrtc_thread is not None:
+                webrtc_thread.join(timeout=5.0)
 
     print_exam_summary(student_history)
     write_report_csv(cfg.report_csv, student_history)
