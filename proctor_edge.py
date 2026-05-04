@@ -142,6 +142,7 @@ class RuntimeConfig:
     supabase_anon_key: Optional[str] = None  # project anon/public key
     session_id: Optional[str] = None         # GuardEye session UUID
     webrtc_enabled: bool = False             # stream annotated video via WebRTC
+    device_id: str = "pi-edge-001"           # shown in Hardware Connection dialog
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -290,7 +291,11 @@ def parse_args() -> RuntimeConfig:
     )
     parser.add_argument(
         "--session-id", default=None,
-        help="GuardEye session UUID shown in the dashboard URL",
+        help="GuardEye session UUID (auto-filled when browser connects via --device-id flow)",
+    )
+    parser.add_argument(
+        "--device-id", default=os.environ.get("GUARDEYE_DEVICE_ID", "pi-edge-001"),
+        help="Device ID shown in the GuardEye Hardware Connection dialog (default: pi-edge-001)",
     )
     parser.add_argument(
         "--webrtc", action="store_true",
@@ -374,6 +379,7 @@ def parse_args() -> RuntimeConfig:
         supabase_anon_key=args.supabase_anon_key,
         session_id=args.session_id,
         webrtc_enabled=bool(args.webrtc),
+        device_id=args.device_id,
     )
 
 
@@ -931,14 +937,137 @@ async def _run_webrtc_sender(
         print("[WebRTC] Peer connection closed.")
 
 
+async def _wait_for_session_assignment(cfg: "RuntimeConfig") -> Optional[str]:
+    """
+    Phase 1 — Boot-and-wait handshake.
+
+    Connects to Supabase Realtime channel `device_cmd_{device_id}` and waits
+    indefinitely for the browser to send an `assign-session` event (triggered
+    when the teacher types the Device ID and clicks "Connect Device").
+
+    On receiving `assign-session`:
+      1. Sends back `device-ack` so the GuardEye UI shows "Device connected!"
+      2. Returns the session UUID for Phase 2.
+
+    If cfg.session_id is already set (manual --session-id flag), skips Phase 1
+    and returns immediately.
+    """
+    if cfg.session_id:
+        print(f"[Device] Session ID pre-set: {cfg.session_id}. Skipping handshake.")
+        return cfg.session_id
+
+    if not cfg.supabase_url or not cfg.supabase_anon_key:
+        print("[Device] Missing --supabase-url / --supabase-anon-key. Cannot listen for assignment.")
+        return None
+
+    realtime_ws_url = (
+        cfg.supabase_url.rstrip("/")
+        .replace("https://", "wss://")
+        .replace("http://", "ws://")
+        + f"/realtime/v1/websocket?apikey={cfg.supabase_anon_key}&vsn=1.0.0"
+    )
+    cmd_channel = f"realtime:device_cmd_{cfg.device_id}"
+
+    print(f"[Device] Listening on channel device_cmd_{cfg.device_id}")
+    print(f"[Device] >>> Enter Device ID  \"{cfg.device_id}\"  in the GuardEye Hardware Connection dialog <<<")
+
+    while True:  # reconnect loop
+        try:
+            async with websockets.connect(realtime_ws_url, ping_interval=30) as ws:
+                await ws.send(json.dumps({
+                    "topic": cmd_channel,
+                    "event": "phx_join",
+                    "payload": {},
+                    "ref": "1",
+                }))
+
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+                    payload = msg.get("payload", {})
+                    if msg.get("event") == "broadcast":
+                        inner_event = payload.get("event")
+                        inner_payload = payload.get("payload", {})
+
+                        if inner_event == "assign-session":
+                            session_id = inner_payload.get("sessionId")
+                            if not session_id:
+                                continue
+
+                            print(f"[Device] Assigned to session: {session_id}")
+
+                            # Send device-ack so the GuardEye UI shows "Device connected!"
+                            await ws.send(json.dumps({
+                                "topic": cmd_channel,
+                                "event": "broadcast",
+                                "payload": {
+                                    "type": "broadcast",
+                                    "event": "device-ack",
+                                    "payload": {},
+                                },
+                                "ref": None,
+                            }))
+                            print("[Device] Sent device-ack. GuardEye UI should show 'Device connected!'")
+                            return session_id
+
+        except Exception as exc:
+            print(f"[Device] Realtime error: {exc}. Reconnecting in 5 s…")
+            await asyncio.sleep(5)
+
+
+async def _run_guardeye_flow(
+    cfg: "RuntimeConfig",
+    frame_queue: "queue.Queue[np.ndarray]",
+    stop_event: threading.Event,
+) -> None:
+    """
+    Full GuardEye connection flow:
+      Phase 1 — wait for browser to assign a session via Hardware Connection dialog.
+      Phase 2 — start WebRTC video streaming for that session.
+
+    Loops back to Phase 1 after each session ends so the Pi is always ready
+    for the next exam without restarting.
+    """
+    while not stop_event.is_set():
+        # Phase 1: wait for session assignment
+        session_id = await _wait_for_session_assignment(cfg)
+        if not session_id:
+            print("[Device] No session ID obtained. Retrying in 10 s…")
+            await asyncio.sleep(10)
+            continue
+
+        # Inject session_id into cfg for alert posting and WebRTC channel
+        cfg.session_id = session_id
+
+        # Phase 2: WebRTC video streaming
+        await _run_webrtc_sender(cfg, frame_queue, stop_event)
+
+        # After session ends, clear session_id and go back to listening
+        print("[Device] Session ended. Returning to standby — ready for next connection.")
+        cfg.session_id = None
+
+
 def start_webrtc_thread(
     cfg: "RuntimeConfig",
     frame_queue: "queue.Queue[np.ndarray]",
     stop_event: threading.Event,
 ) -> Optional[threading.Thread]:
     """
-    Starts the WebRTC sender in a dedicated asyncio thread so it doesn't block
-    the OpenCV capture loop.  Returns the thread so main() can join it on exit.
+    Starts the full GuardEye connection flow in a dedicated asyncio thread:
+
+      Phase 1 — Device handshake (if session_id not already set):
+        Listens on Supabase Realtime channel `device_cmd_{device_id}`.
+        When the browser sends `assign-session`, replies with `device-ack`
+        and captures the session UUID.
+
+      Phase 2 — WebRTC streaming:
+        Joins channel `webrtc_{session_id}`, waits for SDP offer from the
+        browser, replies with answer, streams annotated frames.
+
+    Returns the thread so main() can join it on exit.
     """
     if not AIORTC_AVAILABLE:
         print("[WebRTC] aiortc not installed — live video streaming disabled.")
@@ -952,7 +1081,7 @@ def start_webrtc_thread(
     def _thread_target() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(_run_webrtc_sender(cfg, frame_queue, stop_event))
+        loop.run_until_complete(_run_guardeye_flow(cfg, frame_queue, stop_event))
         loop.close()
 
     t = threading.Thread(target=_thread_target, daemon=True, name="webrtc-sender")
@@ -1525,7 +1654,20 @@ def main() -> None:
     webrtc_stop = threading.Event()
     frame_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)  # 2-frame buffer
     webrtc_thread: Optional[threading.Thread] = None
-    if cfg.webrtc_enabled:
+
+    # Auto-enable GuardEye integration when Supabase creds are present,
+    # even if --webrtc flag was not explicitly passed.
+    guardeye_active = cfg.webrtc_enabled or bool(cfg.supabase_url and cfg.supabase_anon_key)
+
+    if guardeye_active:
+        print("")
+        print("=" * 55)
+        print(f"  GuardEye Device ID  :  {cfg.device_id}")
+        print(f"  Go to               :  https://guardeye.onrender.com/dashboard/start")
+        print(f"  Select a session, click 'Start', enter the Device ID above")
+        print("=" * 55)
+        print("")
+        cfg.webrtc_enabled = True  # ensure frame pushing is active
         webrtc_thread = start_webrtc_thread(cfg, frame_queue, webrtc_stop)
 
     try:

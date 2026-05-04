@@ -1,0 +1,19 @@
+[Unit]
+Description=GuardEye AI Proctoring Edge Device
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/Desktop/edgedevice
+EnvironmentFile=/home/admin/Desktop/edgedevice/.env
+ExecStart=/home/admin/Desktop/edgedevice/venv/bin/python3 /home/admin/Desktop/edgedevice/proctor_edge.py --source 0 --headless --alert-threshold 0.75 --alert-cooldown-sec 10 --camera-fps 30 --status-every-frames 60
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
