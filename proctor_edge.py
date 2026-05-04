@@ -28,7 +28,7 @@ from ultralytics import YOLO
 # If not installed the script still works – live video streaming is disabled.
 # ---------------------------------------------------------------------------
 try:
-    from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, VideoStreamTrack
     from aiortc.contrib.media import MediaBlackhole
     import fractions
     import av
@@ -817,13 +817,19 @@ async def _run_webrtc_sender(
     """
     Async coroutine that:
       1. Connects to the Supabase Realtime WebSocket for channel `webrtc_{session_id}`.
-      2. Waits for an SDP `offer` broadcast from the GuardEye browser.
-      3. Creates an RTCPeerConnection, attaches the AnnotatedFrameTrack, and
-         sends back an SDP `answer`.
+      2. Waits for `viewer-ready` from the browser, then sends `pi-ready`
+         so the browser knows to (re)send its WebRTC offer.
+      3. Receives the SDP offer, creates an RTCPeerConnection, attaches the
+         AnnotatedFrameTrack, and sends back an SDP answer.
       4. Handles ICE candidate exchange.
       5. Keeps running until `stop_event` is set.
 
     The channel and message format exactly mirror LiveMonitoring.tsx in guardeye.
+
+    Key fix: the browser sends `viewer-ready` on channel subscribe, then
+    immediately sends the offer. Because the Pi may join the channel AFTER
+    the browser has already sent the offer (missed broadcast), the Pi also
+    sends `pi-ready` when it joins so the browser can re-send its offer.
     """
     if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
         print("[WebRTC] Missing --supabase-url / --supabase-anon-key / --session-id. Skipping.")
@@ -838,32 +844,32 @@ async def _run_webrtc_sender(
     )
 
     channel_topic = f"realtime:webrtc_{cfg.session_id}"
-    pc: Optional[RTCPeerConnection] = None
-    track: Optional["AnnotatedFrameTrack"] = None
     fps = cfg.camera_fps
 
     print(f"[WebRTC] Connecting to Supabase Realtime channel webrtc_{cfg.session_id} …")
 
     try:
-        async with websockets.connect(realtime_ws_url) as ws:
+        async with websockets.connect(realtime_ws_url, ping_interval=20) as ws:
             # Join the Realtime channel
-            join_msg = json.dumps({
+            await ws.send(json.dumps({
                 "topic": channel_topic,
                 "event": "phx_join",
                 "payload": {},
                 "ref": "1",
-            })
-            await ws.send(join_msg)
-            print("[WebRTC] Joined Realtime channel. Waiting for browser offer…")
+            }))
 
             async def send_broadcast(event: str, payload: Dict[str, Any]) -> None:
-                msg = json.dumps({
+                await ws.send(json.dumps({
                     "topic": channel_topic,
                     "event": "broadcast",
                     "payload": {"type": "broadcast", "event": event, "payload": payload},
                     "ref": None,
-                })
-                await ws.send(msg)
+                }))
+
+            # Wait for phx_reply confirming we joined, then announce pi-ready
+            # so the browser re-sends its offer if it already subscribed.
+            joined = False
+            pc: Optional[RTCPeerConnection] = None
 
             async for raw in ws:
                 if stop_event.is_set():
@@ -877,21 +883,43 @@ async def _run_webrtc_sender(
                 event = msg.get("event")
                 payload = msg.get("payload", {})
 
+                # Once channel join is confirmed, broadcast pi-ready
+                if not joined and event in ("phx_reply", "phx_ok"):
+                    joined = True
+                    print("[WebRTC] Joined channel. Sending pi-ready to browser…")
+                    await send_broadcast("pi-ready", {})
+                    print("[WebRTC] Waiting for browser offer…")
+
                 # Unwrap Supabase broadcast envelope
                 if event == "broadcast":
                     inner_event = payload.get("event")
                     inner_payload = payload.get("payload", {})
 
-                    if inner_event == "offer" and pc is None:
-                        print("[WebRTC] Received offer from browser. Creating peer connection…")
-                        pc = RTCPeerConnection()
+                    # Browser signals it's ready — respond so it sends the offer
+                    if inner_event == "viewer-ready":
+                        print("[WebRTC] Browser viewer-ready received. Sending pi-ready…")
+                        await send_broadcast("pi-ready", {})
+
+                    elif inner_event == "offer":
+                        # Close previous peer connection if re-negotiating
+                        if pc is not None:
+                            await pc.close()
+                            pc = None
+
+                        print("[WebRTC] Received offer. Creating peer connection…")
+                        pc = RTCPeerConnection(configuration={
+                            "iceServers": [{"urls": "stun:stun.l.google.com:19302"}]
+                        })
                         track = AnnotatedFrameTrack(frame_queue, fps)
                         pc.addTrack(track)
+
+                        # Capture send_broadcast in closure for ICE callback
+                        _send = send_broadcast
 
                         @pc.on("icecandidate")
                         async def on_ice(candidate: Any) -> None:
                             if candidate:
-                                await send_broadcast("candidate", {"candidate": {
+                                await _send("candidate", {"candidate": {
                                     "candidate": candidate.candidate,
                                     "sdpMid": candidate.sdpMid,
                                     "sdpMLineIndex": candidate.sdpMLineIndex,
@@ -908,26 +936,22 @@ async def _run_webrtc_sender(
                             "sdp": pc.localDescription.sdp,
                             "type": pc.localDescription.type,
                         }})
-                        print("[WebRTC] Sent answer. Streaming video…")
+                        print("[WebRTC] Sent answer. Video streaming…")
 
                     elif inner_event == "candidate" and pc is not None:
                         cand_data = inner_payload.get("candidate", {})
-                        if cand_data.get("candidate"):
-                            from aiortc import RTCIceCandidate
-                            candidate = RTCIceCandidate(
-                                foundation="",
-                                component=1,
-                                protocol="udp",
-                                priority=0,
-                                host="",
-                                port=0,
-                                type="host",
-                                sdpMid=cand_data.get("sdpMid"),
-                                sdpMLineIndex=cand_data.get("sdpMLineIndex"),
-                            )
-                            # Pass the raw candidate string via the sdp attribute
-                            candidate.sdp = cand_data["candidate"]
-                            await pc.addIceCandidate(candidate)
+                        raw_cand = cand_data.get("candidate", "")
+                        if raw_cand:
+                            try:
+                                await pc.addIceCandidate(
+                                    RTCIceCandidate(
+                                        sdpMid=cand_data.get("sdpMid"),
+                                        sdpMLineIndex=cand_data.get("sdpMLineIndex"),
+                                        candidate=raw_cand,
+                                    )
+                                )
+                            except Exception as ice_err:
+                                print(f"[WebRTC] ICE candidate error: {ice_err}")
 
     except Exception as exc:
         print(f"[WebRTC] Connection error: {exc}")
@@ -1016,6 +1040,77 @@ async def _wait_for_session_assignment(cfg: "RuntimeConfig") -> Optional[str]:
         except Exception as exc:
             print(f"[Device] Realtime error: {exc}. Reconnecting in 5 s…")
             await asyncio.sleep(5)
+
+
+async def _wait_for_browser_ready(cfg: "RuntimeConfig") -> bool:
+    """
+    Phase 2 — wait for the browser to open the Live Monitoring page.
+
+    Listens on `webrtc_{session_id}` for the `viewer-ready` broadcast that
+    LiveMonitoring.tsx sends as soon as it subscribes to the channel.
+
+    Returns True when the browser is connected, False on timeout (2 min).
+    The camera and AI models are NOT started until this returns True.
+    """
+    realtime_ws_url = (
+        cfg.supabase_url.rstrip("/")
+        .replace("https://", "wss://")
+        .replace("http://", "ws://")
+        + f"/realtime/v1/websocket?apikey={cfg.supabase_anon_key}&vsn=1.0.0"
+    )
+    channel_topic = f"realtime:webrtc_{cfg.session_id}"
+    deadline = asyncio.get_event_loop().time() + 120  # 2-minute timeout
+
+    print(f"[Device] Waiting for browser to open Live Monitoring… (2 min timeout)")
+
+    try:
+        async with websockets.connect(realtime_ws_url, ping_interval=20) as ws:
+            await ws.send(json.dumps({
+                "topic": channel_topic,
+                "event": "phx_join",
+                "payload": {},
+                "ref": "2",
+            }))
+
+            async def send_broadcast(event: str, payload: Dict[str, Any]) -> None:
+                await ws.send(json.dumps({
+                    "topic": channel_topic,
+                    "event": "broadcast",
+                    "payload": {"type": "broadcast", "event": event, "payload": payload},
+                    "ref": None,
+                }))
+
+            joined = False
+            async for raw in ws:
+                if asyncio.get_event_loop().time() > deadline:
+                    print("[Device] Timeout: browser did not open Live Monitoring in 2 min.")
+                    return False
+
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                event = msg.get("event")
+                payload = msg.get("payload", {})
+
+                # Announce pi-ready once joined so browser knows Pi is here
+                if not joined and event in ("phx_reply", "phx_ok"):
+                    joined = True
+                    await send_broadcast("pi-ready", {})
+
+                if event == "broadcast":
+                    inner_event = payload.get("event")
+                    if inner_event == "viewer-ready":
+                        print("[Device] Browser is live! Starting camera and AI…")
+                        # Send pi-ready so browser triggers a fresh offer
+                        await send_broadcast("pi-ready", {})
+                        return True
+
+    except Exception as exc:
+        print(f"[Device] Error waiting for browser: {exc}")
+
+    return False
 
 
 async def _run_guardeye_flow(
@@ -1594,17 +1689,16 @@ def write_report_csv(path: str, student_history: Dict[int, Dict[str, Any]]) -> N
             )
 
 
-def main() -> None:
-    cfg = parse_args()
-
-    if cfg.raspi_mode:
-        print("Raspberry Pi mode enabled")
-        print(
-            f"Pi runtime config: {cfg.width}x{cfg.height}, det_imgsz={cfg.det_imgsz}, "
-            f"pose_imgsz={cfg.pose_imgsz}, pose_interval={cfg.pose_interval}, "
-            f"contraband_interval={cfg.contraband_interval}, headless={cfg.headless}, "
-            f"frame_fit={cfg.frame_fit}"
-        )
+def _run_session(cfg: RuntimeConfig, session_id: str) -> None:
+    """
+    Run one full proctoring session:
+      - Opens camera
+      - Loads YOLO models
+      - Runs detection loop
+      - Closes camera when session ends (browser disconnects or Ctrl+C)
+    """
+    cfg.session_id = session_id
+    print(f"\n[Session] Starting proctoring for session {session_id}")
 
     if torch is not None:
         try:
@@ -1626,10 +1720,8 @@ def main() -> None:
 
     cap, is_webcam = create_capture(cfg.source, cfg)
     if cap is None:
-        print(f"Unable to open source: {cfg.source_raw}")
+        print(f"[Session] Unable to open camera source: {cfg.source_raw}")
         if cfg.raspi_mode:
-            print("Raspberry Pi camera hint: try --source pi --raspi --camera-fps 30")
-            print("If running over SSH without display, use --headless and provide --output annotated.mp4")
             print_raspi_camera_diagnostics(cfg.source_raw)
         return
 
@@ -1645,30 +1737,17 @@ def main() -> None:
 
     event_log = setup_event_log(cfg.event_log_csv)
 
+    # WebRTC frame queue — started fresh each session
+    webrtc_stop = threading.Event()
+    frame_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)
+    webrtc_thread = start_webrtc_thread(cfg, frame_queue, webrtc_stop)
+
     frame_index = 0
     pose_cache: List[Dict[str, Any]] = []
     contraband_cache: List[Dict[str, Any]] = []
     student_history: Dict[int, Dict[str, Any]] = {}
 
-    # --- WebRTC live video (NEW) ---
-    webrtc_stop = threading.Event()
-    frame_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)  # 2-frame buffer
-    webrtc_thread: Optional[threading.Thread] = None
-
-    # Auto-enable GuardEye integration when Supabase creds are present,
-    # even if --webrtc flag was not explicitly passed.
-    guardeye_active = cfg.webrtc_enabled or bool(cfg.supabase_url and cfg.supabase_anon_key)
-
-    if guardeye_active:
-        print("")
-        print("=" * 55)
-        print(f"  GuardEye Device ID  :  {cfg.device_id}")
-        print(f"  Go to               :  https://guardeye.onrender.com/dashboard/start")
-        print(f"  Select a session, click 'Start', enter the Device ID above")
-        print("=" * 55)
-        print("")
-        cfg.webrtc_enabled = True  # ensure frame pushing is active
-        webrtc_thread = start_webrtc_thread(cfg, frame_queue, webrtc_stop)
+    print(f"[Session] Camera open. Detection running. Streaming to GuardEye…")
 
     try:
         while True:
@@ -1681,25 +1760,17 @@ def main() -> None:
                 frame = cv2.flip(frame, 1)
 
             annotated, tracked_students, pose_cache, contraband_cache, _global_items = process_frame(
-                frame,
-                frame_index,
-                det_model,
-                pose_model,
-                tracker,
-                cfg,
-                pose_cache,
-                contraband_cache,
-                student_history,
+                frame, frame_index, det_model, pose_model, tracker, cfg,
+                pose_cache, contraband_cache, student_history,
             )
 
             update_student_report_stats(tracked_students, student_history)
             maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir)
             handle_events_and_alerts(frame_index, tracked_students, student_history, event_log, cfg)
 
-            # --- Push annotated frame to WebRTC sender (NEW) ---
-            if cfg.webrtc_enabled and webrtc_thread is not None:
+            # Push frame to WebRTC sender
+            if webrtc_thread is not None:
                 try:
-                    # Non-blocking put; drop frame if consumer is behind (avoids blocking capture)
                     frame_queue.put_nowait(annotated.copy())
                 except queue.Full:
                     pass
@@ -1707,10 +1778,7 @@ def main() -> None:
             if cfg.headless and (frame_index % cfg.status_every_frames == 0):
                 student_count = len(tracked_students)
                 max_risk = max((float(s["risk"]) for s in tracked_students.values()), default=0.0)
-                print(
-                    f"status frame={frame_index} tracked_students={student_count} "
-                    f"max_risk={max_risk:.2f}"
-                )
+                print(f"status frame={frame_index} tracked_students={student_count} max_risk={max_risk:.2f}")
 
             if writer is not None:
                 writer.write(annotated)
@@ -1722,21 +1790,134 @@ def main() -> None:
                     break
 
             frame_index += 1
+
     finally:
         cap.release()
         if writer is not None:
             writer.release()
         close_event_log(event_log)
         cv2.destroyAllWindows()
-        # --- Stop WebRTC thread (NEW) ---
-        if cfg.webrtc_enabled:
-            webrtc_stop.set()
-            if webrtc_thread is not None:
-                webrtc_thread.join(timeout=5.0)
+        webrtc_stop.set()
+        if webrtc_thread is not None:
+            webrtc_thread.join(timeout=5.0)
 
     print_exam_summary(student_history)
     write_report_csv(cfg.report_csv, student_history)
-    print(f"\nReport CSV written: {cfg.report_csv}")
+    print(f"[Session] Report written: {cfg.report_csv}")
+    print(f"[Session] Session {session_id} ended. Returning to standby…\n")
+
+
+def main() -> None:
+    cfg = parse_args()
+
+    if cfg.raspi_mode:
+        print("Raspberry Pi mode enabled")
+        print(
+            f"Pi config: {cfg.width}x{cfg.height}, det_imgsz={cfg.det_imgsz}, "
+            f"pose_imgsz={cfg.pose_imgsz}, headless={cfg.headless}"
+        )
+
+    guardeye_active = cfg.webrtc_enabled or bool(cfg.supabase_url and cfg.supabase_anon_key)
+
+    if not guardeye_active:
+        # No Supabase creds — run immediately in standalone mode (original behaviour)
+        if torch is not None:
+            try:
+                torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
+                torch.set_num_interop_threads(1)
+            except Exception:
+                pass
+        pose_model = YOLO("yolov8n-pose.pt")
+        det_model = YOLO("yolov8n.pt")
+        tracker = DeepSort(max_age=30, n_init=2, nms_max_overlap=1.0, max_cosine_distance=0.3)
+        cap, is_webcam = create_capture(cfg.source, cfg)
+        if cap is None:
+            print(f"Unable to open source: {cfg.source_raw}")
+            return
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        event_log = setup_event_log(cfg.event_log_csv)
+        frame_index = 0
+        pose_cache: List[Dict[str, Any]] = []
+        contraband_cache: List[Dict[str, Any]] = []
+        student_history: Dict[int, Dict[str, Any]] = {}
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                frame = fit_frame(frame, cfg.width, cfg.height, cfg.frame_fit)
+                if is_webcam:
+                    frame = cv2.flip(frame, 1)
+                annotated, tracked_students, pose_cache, contraband_cache, _ = process_frame(
+                    frame, frame_index, det_model, pose_model, tracker, cfg,
+                    pose_cache, contraband_cache, student_history,
+                )
+                update_student_report_stats(tracked_students, student_history)
+                maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir)
+                handle_events_and_alerts(frame_index, tracked_students, student_history, event_log, cfg)
+                if cfg.headless and (frame_index % cfg.status_every_frames == 0):
+                    max_risk = max((float(s["risk"]) for s in tracked_students.values()), default=0.0)
+                    print(f"status frame={frame_index} tracked_students={len(tracked_students)} max_risk={max_risk:.2f}")
+                if not cfg.headless:
+                    cv2.imshow("AI Proctor", annotated)
+                    if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                        break
+                frame_index += 1
+        finally:
+            cap.release()
+            close_event_log(event_log)
+            cv2.destroyAllWindows()
+        print_exam_summary(student_history)
+        write_report_csv(cfg.report_csv, student_history)
+        return
+
+    # ── GuardEye mode: standby loop ─────────────────────────────────────────
+    # The Pi idles here (no camera, no AI) until the browser connects.
+    # CPU usage in standby: ~0% — only a WebSocket connection is held open.
+    cfg.webrtc_enabled = True
+
+    print("")
+    print("=" * 55)
+    print(f"  GuardEye Device ID  :  {cfg.device_id}")
+    print(f"  Go to               :  https://guardeye.onrender.com/dashboard/start")
+    print(f"  Select a session → click Start → enter the Device ID above")
+    print(f"  Camera will start automatically when the session begins.")
+    print("=" * 55)
+    print("")
+
+    # Standby loop: wait → browser connects → session → wait → …
+    while True:
+        # Phase 1: wait for teacher to type Device ID in Hardware Connection dialog
+        loop = asyncio.new_event_loop()
+        session_id = loop.run_until_complete(_wait_for_session_assignment(cfg))
+        loop.close()
+
+        if not session_id:
+            print("[Standby] No session received. Retrying in 10 s…")
+            time.sleep(10)
+            continue
+
+        cfg.session_id = session_id
+
+        # Phase 2: wait for browser to open Live Monitoring page
+        # Camera and AI do NOT start until the browser is actually watching
+        loop = asyncio.new_event_loop()
+        browser_ready = loop.run_until_complete(_wait_for_browser_ready(cfg))
+        loop.close()
+
+        if not browser_ready:
+            print("[Standby] Browser never opened. Returning to standby.")
+            cfg.session_id = None
+            continue
+
+        # Phase 3: browser is live — start camera + AI + WebRTC streaming
+        _run_session(cfg, session_id)
+
+        # Session ended — clear session_id and go back to standby
+        cfg.session_id = None
+        print("[Standby] Ready for next session.")
+        print(f"  Enter Device ID  \"{cfg.device_id}\"  in GuardEye to start again.")
+        print("")
 
 
 if __name__ == "__main__":
