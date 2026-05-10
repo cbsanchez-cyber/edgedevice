@@ -29,6 +29,7 @@ from ultralytics import YOLO
 # ---------------------------------------------------------------------------
 try:
     from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, VideoStreamTrack
+    from aiortc.sdp import candidate_from_sdp
     from aiortc.contrib.media import MediaBlackhole
     import fractions
     import av
@@ -815,48 +816,41 @@ async def _run_webrtc_sender(
     stop_event: threading.Event,
 ) -> None:
     """
-    Async coroutine that:
-      1. Connects to the Supabase Realtime WebSocket for channel `webrtc_{session_id}`.
-      2. Waits for `viewer-ready` from the browser, then sends `pi-ready`
-         so the browser knows to (re)send its WebRTC offer.
-      3. Receives the SDP offer, creates an RTCPeerConnection, attaches the
-         AnnotatedFrameTrack, and sends back an SDP answer.
-      4. Handles ICE candidate exchange.
-      5. Keeps running until `stop_event` is set.
+    WebRTC video sender using aiortc.
 
-    The channel and message format exactly mirror LiveMonitoring.tsx in guardeye.
-
-    Key fix: the browser sends `viewer-ready` on channel subscribe, then
-    immediately sends the offer. Because the Pi may join the channel AFTER
-    the browser has already sent the offer (missed broadcast), the Pi also
-    sends `pi-ready` when it joins so the browser can re-send its offer.
+    Signaling flow (mirrors LiveMonitoring.tsx exactly):
+      Pi joins webrtc_{session_id} channel
+        → sends pi-ready  (so browser re-sends offer if it already subscribed)
+      Browser sends viewer-ready
+        → Pi sends pi-ready again
+      Browser sends offer
+        → Pi answers + ICE exchange → video streams
     """
     if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
-        print("[WebRTC] Missing --supabase-url / --supabase-anon-key / --session-id. Skipping.")
+        print("[WebRTC] Missing credentials/session_id. Skipping.")
         return
 
-    # Supabase Realtime WebSocket endpoint
     realtime_ws_url = (
         cfg.supabase_url.rstrip("/")
         .replace("https://", "wss://")
         .replace("http://", "ws://")
         + f"/realtime/v1/websocket?apikey={cfg.supabase_anon_key}&vsn=1.0.0"
     )
-
     channel_topic = f"realtime:webrtc_{cfg.session_id}"
     fps = cfg.camera_fps
+    pc: Optional[RTCPeerConnection] = None
 
-    print(f"[WebRTC] Connecting to Supabase Realtime channel webrtc_{cfg.session_id} …")
+    async def make_pc() -> RTCPeerConnection:
+        """Create a fresh RTCPeerConnection with the video track attached."""
+        new_pc = RTCPeerConnection()
+        track = AnnotatedFrameTrack(frame_queue, fps)
+        new_pc.addTrack(track)
+        return new_pc
+
+    print(f"[WebRTC] Connecting to channel webrtc_{cfg.session_id}…")
 
     try:
         async with websockets.connect(realtime_ws_url, ping_interval=20) as ws:
-            # Join the Realtime channel
-            await ws.send(json.dumps({
-                "topic": channel_topic,
-                "event": "phx_join",
-                "payload": {},
-                "ref": "1",
-            }))
 
             async def send_broadcast(event: str, payload: Dict[str, Any]) -> None:
                 await ws.send(json.dumps({
@@ -866,10 +860,15 @@ async def _run_webrtc_sender(
                     "ref": None,
                 }))
 
-            # Wait for phx_reply confirming we joined, then announce pi-ready
-            # so the browser re-sends its offer if it already subscribed.
+            # Join channel
+            await ws.send(json.dumps({
+                "topic": channel_topic,
+                "event": "phx_join",
+                "payload": {},
+                "ref": "1",
+            }))
+
             joined = False
-            pc: Optional[RTCPeerConnection] = None
 
             async for raw in ws:
                 if stop_event.is_set():
@@ -880,85 +879,98 @@ async def _run_webrtc_sender(
                 except json.JSONDecodeError:
                     continue
 
-                event = msg.get("event")
+                ev = msg.get("event", "")
                 payload = msg.get("payload", {})
 
-                # Once channel join is confirmed, broadcast pi-ready
-                if not joined and event in ("phx_reply", "phx_ok"):
+                if not joined and ev in ("phx_reply", "phx_ok"):
                     joined = True
-                    print("[WebRTC] Joined channel. Sending pi-ready to browser…")
+                    # Browser is already confirmed ready (gated by _wait_for_browser_ready).
+                    # Send pi-ready to re-trigger a fresh offer, since the first offer
+                    # arrived before this sender had joined the channel.
+                    print("[WebRTC] Joined channel. Sending pi-ready to re-trigger offer…")
                     await send_broadcast("pi-ready", {})
-                    print("[WebRTC] Waiting for browser offer…")
 
-                # Unwrap Supabase broadcast envelope
-                if event == "broadcast":
-                    inner_event = payload.get("event")
-                    inner_payload = payload.get("payload", {})
+                if ev != "broadcast":
+                    continue
 
-                    # Browser signals it's ready — respond so it sends the offer
-                    if inner_event == "viewer-ready":
-                        print("[WebRTC] Browser viewer-ready received. Sending pi-ready…")
-                        await send_broadcast("pi-ready", {})
+                inner_event = payload.get("event", "")
+                inner_payload = payload.get("payload", {})
 
-                    elif inner_event == "offer":
-                        # Close previous peer connection if re-negotiating
-                        if pc is not None:
-                            await pc.close()
-                            pc = None
+                # ── viewer-ready: browser re-connected or re-subscribed ─────
+                if inner_event == "viewer-ready":
+                    print("[WebRTC] viewer-ready from browser. Sending pi-ready…")
+                    await send_broadcast("pi-ready", {})
 
-                        print("[WebRTC] Received offer. Creating peer connection…")
-                        pc = RTCPeerConnection(configuration={
-                            "iceServers": [{"urls": "stun:stun.l.google.com:19302"}]
-                        })
-                        track = AnnotatedFrameTrack(frame_queue, fps)
-                        pc.addTrack(track)
+                # ── offer: browser sent SDP offer ──────────────────────────
+                elif inner_event == "offer":
+                    print("[WebRTC] Offer received. Negotiating…")
 
-                        # Capture send_broadcast in closure for ICE callback
-                        _send = send_broadcast
+                    # Clean up previous connection
+                    if pc is not None:
+                        await pc.close()
 
-                        @pc.on("icecandidate")
-                        async def on_ice(candidate: Any) -> None:
-                            if candidate:
-                                await _send("candidate", {"candidate": {
+                    pc = await make_pc()
+
+                    # Collect ICE candidates and send them after answer
+                    ice_candidates: List[Any] = []
+
+                    @pc.on("icecandidate")
+                    async def on_ice(candidate: Any) -> None:
+                        if candidate is None:
+                            return
+                        # aiortc candidate object has .candidate, .sdpMid, .sdpMLineIndex
+                        try:
+                            await send_broadcast("candidate", {
+                                "candidate": {
                                     "candidate": candidate.candidate,
                                     "sdpMid": candidate.sdpMid,
                                     "sdpMLineIndex": candidate.sdpMLineIndex,
-                                }})
+                                }
+                            })
+                            print(f"[WebRTC] Sent ICE candidate: {candidate.sdpMid}")
+                        except Exception as e:
+                            print(f"[WebRTC] Failed to send ICE candidate: {e}")
 
-                        offer_sdp = RTCSessionDescription(
-                            sdp=inner_payload["offer"]["sdp"],
-                            type=inner_payload["offer"]["type"],
-                        )
-                        await pc.setRemoteDescription(offer_sdp)
-                        answer = await pc.createAnswer()
-                        await pc.setLocalDescription(answer)
-                        await send_broadcast("answer", {"answer": {
+                    # Set remote description (the browser's offer)
+                    await pc.setRemoteDescription(RTCSessionDescription(
+                        sdp=inner_payload["offer"]["sdp"],
+                        type=inner_payload["offer"]["type"],
+                    ))
+
+                    # Create answer
+                    answer = await pc.createAnswer()
+                    await pc.setLocalDescription(answer)
+
+                    await send_broadcast("answer", {
+                        "answer": {
                             "sdp": pc.localDescription.sdp,
                             "type": pc.localDescription.type,
-                        }})
-                        print("[WebRTC] Sent answer. Video streaming…")
+                        }
+                    })
+                    print("[WebRTC] Answer sent. Streaming video…")
 
-                    elif inner_event == "candidate" and pc is not None:
-                        cand_data = inner_payload.get("candidate", {})
-                        raw_cand = cand_data.get("candidate", "")
-                        if raw_cand:
-                            try:
-                                await pc.addIceCandidate(
-                                    RTCIceCandidate(
-                                        sdpMid=cand_data.get("sdpMid"),
-                                        sdpMLineIndex=cand_data.get("sdpMLineIndex"),
-                                        candidate=raw_cand,
-                                    )
-                                )
-                            except Exception as ice_err:
-                                print(f"[WebRTC] ICE candidate error: {ice_err}")
+                # ── candidate: browser ICE candidate ───────────────────────
+                elif inner_event == "candidate" and pc is not None:
+                    cand_data = inner_payload.get("candidate", {})
+                    raw_cand = cand_data.get("candidate", "")
+                    if not raw_cand:
+                        continue
+                    try:
+                        # Parse the candidate string into aiortc RTCIceCandidate
+                        candidate = candidate_from_sdp(raw_cand.split("candidate:")[-1])
+                        candidate.sdpMid = cand_data.get("sdpMid")
+                        candidate.sdpMLineIndex = cand_data.get("sdpMLineIndex")
+                        await pc.addIceCandidate(candidate)
+                        print(f"[WebRTC] Added ICE candidate from browser")
+                    except Exception as ice_err:
+                        print(f"[WebRTC] ICE candidate error: {ice_err}")
 
     except Exception as exc:
         print(f"[WebRTC] Connection error: {exc}")
     finally:
         if pc is not None:
             await pc.close()
-        print("[WebRTC] Peer connection closed.")
+        print("[WebRTC] Connection closed.")
 
 
 async def _wait_for_session_assignment(cfg: "RuntimeConfig") -> Optional[str]:
@@ -1094,10 +1106,9 @@ async def _wait_for_browser_ready(cfg: "RuntimeConfig") -> bool:
                 event = msg.get("event")
                 payload = msg.get("payload", {})
 
-                # Announce pi-ready once joined so browser knows Pi is here
                 if not joined and event in ("phx_reply", "phx_ok"):
                     joined = True
-                    await send_broadcast("pi-ready", {})
+                    print("[Device] Joined channel. Waiting for viewer-ready…")
 
                 if event == "broadcast":
                     inner_event = payload.get("event")

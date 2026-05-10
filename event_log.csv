@@ -1,0 +1,2 @@
+event_ts_iso,event_ts_ms,frame_index,student_id,event_type,risk_score,head_status,alert_threshold,details
+2026-05-10T12:06:12.873711+00:00,1778414772873,320,4,head_pose_warning,0.3500,Looking Left!,0.75,transition=forward_to_non_forward
