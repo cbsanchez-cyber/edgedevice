@@ -204,6 +204,10 @@ class Picamera2CaptureWrapper:
             self._cam.stop()
         except Exception:
             pass
+        try:
+            self._cam.close()  # fully releases hardware; stop() alone keeps it allocated
+        except Exception:
+            pass
         self._opened = False
 
     def get(self, prop_id: int) -> float:
@@ -814,6 +818,7 @@ async def _run_webrtc_sender(
     cfg: "RuntimeConfig",
     frame_queue: "queue.Queue[np.ndarray]",
     stop_event: threading.Event,
+    session_stop_event: threading.Event,
 ) -> None:
     """
     WebRTC video sender using aiortc.
@@ -825,6 +830,9 @@ async def _run_webrtc_sender(
         → Pi sends pi-ready again
       Browser sends offer
         → Pi answers + ICE exchange → video streams
+
+    When the browser closes the connection, RTCPeerConnection state changes to
+    "closed" or "failed" and session_stop_event is set to stop the capture loop.
     """
     if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
         print("[WebRTC] Missing credentials/session_id. Skipping.")
@@ -845,6 +853,15 @@ async def _run_webrtc_sender(
         new_pc = RTCPeerConnection()
         track = AnnotatedFrameTrack(frame_queue, fps)
         new_pc.addTrack(track)
+
+        @new_pc.on("connectionstatechange")
+        async def on_connection_state_change() -> None:
+            state = new_pc.connectionState
+            print(f"[WebRTC] Connection state: {state}")
+            if state in ("closed", "failed"):
+                print("[WebRTC] Browser disconnected — signalling session stop.")
+                session_stop_event.set()
+
         return new_pc
 
     print(f"[WebRTC] Connecting to channel webrtc_{cfg.session_id}…")
@@ -870,9 +887,13 @@ async def _run_webrtc_sender(
 
             joined = False
 
-            async for raw in ws:
+            while True:
                 if stop_event.is_set():
                     break
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue  # check stop_event again
 
                 try:
                     msg = json.loads(raw)
@@ -964,6 +985,15 @@ async def _run_webrtc_sender(
                         print(f"[WebRTC] Added ICE candidate from browser")
                     except Exception as ice_err:
                         print(f"[WebRTC] ICE candidate error: {ice_err}")
+
+                # ── session-ended: teacher ended the exam ──────────────────
+                elif inner_event == "session-ended":
+                    print("[WebRTC] session-ended received — stopping session.")
+                    session_stop_event.set()
+                    if pc is not None:
+                        await pc.close()  # drops video stream to browser immediately
+                        pc = None         # prevents double-close in finally block
+                    break  # exit WebSocket loop
 
     except Exception as exc:
         print(f"[WebRTC] Connection error: {exc}")
@@ -1128,38 +1158,24 @@ async def _run_guardeye_flow(
     cfg: "RuntimeConfig",
     frame_queue: "queue.Queue[np.ndarray]",
     stop_event: threading.Event,
+    session_stop_event: threading.Event,
 ) -> None:
     """
-    Full GuardEye connection flow:
-      Phase 1 — wait for browser to assign a session via Hardware Connection dialog.
-      Phase 2 — start WebRTC video streaming for that session.
+    Runs WebRTC streaming for exactly one session, then exits.
 
-    Loops back to Phase 1 after each session ends so the Pi is always ready
-    for the next exam without restarting.
+    Session assignment and standby-loop reconnection are owned by main().
+    This function must NOT call _wait_for_session_assignment() or loop —
+    doing so races with the main standby loop and causes the thread to grab
+    the next assign-session on a stale frame_queue with no camera.
     """
-    while not stop_event.is_set():
-        # Phase 1: wait for session assignment
-        session_id = await _wait_for_session_assignment(cfg)
-        if not session_id:
-            print("[Device] No session ID obtained. Retrying in 10 s…")
-            await asyncio.sleep(10)
-            continue
-
-        # Inject session_id into cfg for alert posting and WebRTC channel
-        cfg.session_id = session_id
-
-        # Phase 2: WebRTC video streaming
-        await _run_webrtc_sender(cfg, frame_queue, stop_event)
-
-        # After session ends, clear session_id and go back to listening
-        print("[Device] Session ended. Returning to standby — ready for next connection.")
-        cfg.session_id = None
+    await _run_webrtc_sender(cfg, frame_queue, stop_event, session_stop_event)
 
 
 def start_webrtc_thread(
     cfg: "RuntimeConfig",
     frame_queue: "queue.Queue[np.ndarray]",
     stop_event: threading.Event,
+    session_stop_event: threading.Event,
 ) -> Optional[threading.Thread]:
     """
     Starts the full GuardEye connection flow in a dedicated asyncio thread:
@@ -1172,6 +1188,9 @@ def start_webrtc_thread(
       Phase 2 — WebRTC streaming:
         Joins channel `webrtc_{session_id}`, waits for SDP offer from the
         browser, replies with answer, streams annotated frames.
+
+    When the browser disconnects, session_stop_event is set so the caller's
+    capture loop can exit cleanly.
 
     Returns the thread so main() can join it on exit.
     """
@@ -1187,7 +1206,7 @@ def start_webrtc_thread(
     def _thread_target() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(_run_guardeye_flow(cfg, frame_queue, stop_event))
+        loop.run_until_complete(_run_guardeye_flow(cfg, frame_queue, stop_event, session_stop_event))
         loop.close()
 
     t = threading.Thread(target=_thread_target, daemon=True, name="webrtc-sender")
@@ -1750,8 +1769,9 @@ def _run_session(cfg: RuntimeConfig, session_id: str) -> None:
 
     # WebRTC frame queue — started fresh each session
     webrtc_stop = threading.Event()
+    session_stop = threading.Event()   # set by WebRTC sender when browser disconnects
     frame_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)
-    webrtc_thread = start_webrtc_thread(cfg, frame_queue, webrtc_stop)
+    webrtc_thread = start_webrtc_thread(cfg, frame_queue, webrtc_stop, session_stop)
 
     frame_index = 0
     pose_cache: List[Dict[str, Any]] = []
@@ -1764,6 +1784,9 @@ def _run_session(cfg: RuntimeConfig, session_id: str) -> None:
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
+                break
+            if session_stop.is_set():
+                print("[Session] Browser disconnected — stopping session.")
                 break
 
             frame = fit_frame(frame, cfg.width, cfg.height, cfg.frame_fit)
