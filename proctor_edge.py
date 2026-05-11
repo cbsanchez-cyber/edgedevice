@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import TextIOWrapper
 from typing import Any, Dict, List, Optional, Tuple, Union
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import cv2
@@ -735,22 +735,20 @@ def post_alert_supabase(cfg: "RuntimeConfig", payload: Dict[str, Any]) -> None:
         return
 
     student_id = str(payload.get("student_id", ""))
-    row = {
-        # user_id is resolved server-side via RLS / service role when using
-        # the anon key + a session token.  We omit it here and rely on the
-        # Supabase policy that allows insert when session_id matches.
-        # If you use a service-role key instead, add "user_id": "<uuid>" here.
+    row: Dict[str, Any] = {
         "session_id": cfg.session_id,
         "studentId": student_id,
         "studentName": f"Student {student_id}",
         "behaviorType": payload.get("event_type", "alert_high_risk_triggered"),
         "riskScore": payload.get("risk_score", 0.0),
-        "headStatus": payload.get("head_status", None),
         "alertThreshold": payload.get("alert_threshold", cfg.alert_threshold),
-        "frameIndex": payload.get("frame_index", None),
-        "details": payload.get("details", None),
-        "frameUrl": None,  # future: upload snapshot image URL here
     }
+    # Only include optional fields when they have a value
+    for key, src in (("headStatus", "head_status"), ("frameIndex", "frame_index"),
+                     ("details", "details"), ("frameUrl", "frameUrl")):
+        val = payload.get(src)
+        if val is not None:
+            row[key] = val
 
     url = f"{cfg.supabase_url.rstrip('/')}/rest/v1/alerts"
     body = json.dumps(row).encode("utf-8")
@@ -761,15 +759,18 @@ def post_alert_supabase(cfg: "RuntimeConfig", payload: Dict[str, Any]) -> None:
             "Content-Type": "application/json",
             "apikey": cfg.supabase_anon_key,
             "Authorization": f"Bearer {cfg.supabase_anon_key}",
-            "Prefer": "return=minimal",  # don't return the inserted row (faster)
+            "Prefer": "return=minimal",
         },
         method="POST",
     )
     try:
         with urlopen(req, timeout=3.0):
-            pass
+            print(f"[Supabase] alert saved: student={student_id} risk={row['riskScore']}")
+    except HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace")
+        print(f"[Supabase] POST alerts → HTTP {exc.code}: {err}")
     except (URLError, TimeoutError, OSError) as exc:
-        print(f"Supabase alert POST failed: {exc}")
+        print(f"[Supabase] POST alerts failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
