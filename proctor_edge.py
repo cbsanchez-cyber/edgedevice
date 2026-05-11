@@ -809,18 +809,16 @@ def upload_student_image_supabase(cfg: "RuntimeConfig", student_id: int, image_p
 def post_event_log_supabase(cfg: "RuntimeConfig", event_data: Dict[str, Any]) -> None:
     if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
         return
-    row = {
+    row: Dict[str, Any] = {
         "session_id": cfg.session_id,
         "student_id": str(event_data.get("student_id", "")),
-        "event_ts_iso": event_data.get("event_ts_iso"),
-        "event_ts_ms": event_data.get("event_ts_ms"),
-        "frame_index": event_data.get("frame_index"),
         "event_type": event_data.get("event_type", ""),
         "risk_score": event_data.get("risk_score", 0.0),
-        "head_status": event_data.get("head_status"),
-        "alert_threshold": event_data.get("alert_threshold"),
-        "details": event_data.get("details"),
     }
+    for key in ("event_ts_iso", "event_ts_ms", "frame_index", "head_status", "alert_threshold", "details"):
+        val = event_data.get(key)
+        if val is not None:
+            row[key] = val
     url = f"{cfg.supabase_url.rstrip('/')}/rest/v1/event_logs"
     body = json.dumps(row).encode("utf-8")
     req = Request(url, data=body, headers={
@@ -831,8 +829,11 @@ def post_event_log_supabase(cfg: "RuntimeConfig", event_data: Dict[str, Any]) ->
     }, method="POST")
     try:
         with urlopen(req, timeout=3.0):
-            pass
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            print(f"[Supabase] event_log saved: student={row['student_id']} type={row['event_type']}")
+    except HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace")
+        print(f"[Supabase] POST event_logs → HTTP {exc.code}: {err}")
+    except (URLError, TimeoutError, OSError) as exc:
         print(f"[Supabase] POST event_logs failed: {exc}")
 
 
@@ -844,16 +845,19 @@ def post_student_reports_supabase(cfg: "RuntimeConfig", student_history: Dict[in
         hist = student_history[sid]
         samples = int(hist.get("samples", 0))
         avg_risk = (float(hist.get("risk_sum", 0.0)) / samples) if samples > 0 else 0.0
-        rows.append({
+        row: Dict[str, Any] = {
             "session_id": cfg.session_id,
             "student_id": str(sid),
             "samples": samples,
             "avg_risk": round(avg_risk, 4),
             "max_risk": round(float(hist.get("risk_max", 0.0)), 4),
             "final_label": str(hist.get("final_label", "NORMAL")),
-            "image_url": hist.get("image_url"),
-            "image_captured_at_ms": hist.get("image_captured_at_ms"),
-        })
+        }
+        for key in ("image_url", "image_captured_at_ms"):
+            val = hist.get(key)
+            if val is not None:
+                row[key] = val
+        rows.append(row)
     if not rows:
         return
     url = f"{cfg.supabase_url.rstrip('/')}/rest/v1/student_reports"
@@ -1163,6 +1167,7 @@ async def _wait_for_session_assignment(cfg: "RuntimeConfig") -> Optional[str]:
                         if inner_event == "assign-session":
                             session_id = inner_payload.get("sessionId")
                             if not session_id:
+                                print("[Device] Received assign-session with no sessionId — waiting for correct one.")
                                 continue
 
                             print(f"[Device] Assigned to session: {session_id}")
@@ -1180,6 +1185,10 @@ async def _wait_for_session_assignment(cfg: "RuntimeConfig") -> Optional[str]:
                             }))
                             print("[Device] Sent device-ack. GuardEye UI should show 'Device connected!'")
                             return session_id
+
+                        elif inner_event in ("cancel-device", "disconnect"):
+                            print(f"[Device] '{inner_event}' received — connection cancelled. Waiting for a new connection.")
+                            # Stay in the loop; wait for the next assign-session
 
         except Exception as exc:
             print(f"[Device] Realtime error: {exc}. Reconnecting in 5 s…")
@@ -1249,6 +1258,9 @@ async def _wait_for_browser_ready(cfg: "RuntimeConfig") -> bool:
                         # Send pi-ready so browser triggers a fresh offer
                         await send_broadcast("pi-ready", {})
                         return True
+                    elif inner_event in ("cancel-session", "session-cancelled", "disconnect"):
+                        print(f"[Device] '{inner_event}' received — session cancelled by user. Returning to standby.")
+                        return False
 
     except Exception as exc:
         print(f"[Device] Error waiting for browser: {exc}")
