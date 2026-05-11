@@ -1676,10 +1676,10 @@ def maybe_capture_snapshot(
         hist["image_path"] = image_path
         hist["image_captured_at_ms"] = ts_ms
         if cfg is not None:
-            def _upload():
-                image_url = upload_student_image_supabase(cfg, int_sid, image_path)
+            def _upload(sid=int_sid, path=image_path, h=hist):
+                image_url = upload_student_image_supabase(cfg, sid, path)
                 if image_url:
-                    hist["image_url"] = image_url
+                    h["image_url"] = image_url
             threading.Thread(target=_upload, daemon=True).start()
 
 
