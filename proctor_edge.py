@@ -682,24 +682,31 @@ def log_event(
     head_status: str,
     alert_threshold: float,
     details: str,
+    cfg=None,
 ) -> None:
-    if handle is None:
-        return
     ts_ms, ts_iso = now_ms_iso()
-    handle.writer.writerow(
-        [
-            ts_iso,
-            ts_ms,
-            frame_index,
-            student_id,
-            event_type,
-            f"{risk_score:.4f}",
-            head_status,
-            f"{alert_threshold:.2f}",
-            details,
-        ]
-    )
-    handle.fh.flush()
+    if handle is not None:
+        handle.writer.writerow(
+            [
+                ts_iso,
+                ts_ms,
+                frame_index,
+                student_id,
+                event_type,
+                f"{risk_score:.4f}",
+                head_status,
+                f"{alert_threshold:.2f}",
+                details,
+            ]
+        )
+        handle.fh.flush()
+    if cfg is not None:
+        event_data = {
+            "student_id": student_id, "event_ts_iso": ts_iso, "event_ts_ms": ts_ms,
+            "frame_index": frame_index, "event_type": event_type, "risk_score": risk_score,
+            "head_status": head_status, "alert_threshold": alert_threshold, "details": details,
+        }
+        threading.Thread(target=post_event_log_supabase, args=(cfg, event_data), daemon=True).start()
 
 
 def post_alert(endpoint: Optional[str], payload: Dict[str, Any]) -> None:
@@ -771,6 +778,100 @@ def post_alert_supabase(cfg: "RuntimeConfig", payload: Dict[str, Any]) -> None:
         print(f"[Supabase] POST alerts → HTTP {exc.code}: {err}")
     except (URLError, TimeoutError, OSError) as exc:
         print(f"[Supabase] POST alerts failed: {exc}")
+
+
+def upload_student_image_supabase(cfg: "RuntimeConfig", student_id: int, image_path: str) -> Optional[str]:
+    if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
+        return None
+    if not os.path.exists(image_path):
+        return None
+    bucket = "student-images"
+    object_path = f"{cfg.session_id}/student_{student_id}.jpg"
+    url = f"{cfg.supabase_url.rstrip('/')}/storage/v1/object/{bucket}/{object_path}"
+    try:
+        with open(image_path, "rb") as f:
+            image_data = f.read()
+        req = Request(url, data=image_data, headers={
+            "Content-Type": "image/jpeg",
+            "apikey": cfg.supabase_anon_key,
+            "Authorization": f"Bearer {cfg.supabase_anon_key}",
+            "x-upsert": "true",
+        }, method="POST")
+        with urlopen(req, timeout=15.0):
+            public_url = f"{cfg.supabase_url.rstrip('/')}/storage/v1/object/public/{bucket}/{object_path}"
+            print(f"[Supabase] image uploaded: student={student_id}")
+            return public_url
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        print(f"[Supabase] image upload failed student={student_id}: {exc}")
+        return None
+
+
+def post_event_log_supabase(cfg: "RuntimeConfig", event_data: Dict[str, Any]) -> None:
+    if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
+        return
+    row = {
+        "session_id": cfg.session_id,
+        "student_id": str(event_data.get("student_id", "")),
+        "event_ts_iso": event_data.get("event_ts_iso"),
+        "event_ts_ms": event_data.get("event_ts_ms"),
+        "frame_index": event_data.get("frame_index"),
+        "event_type": event_data.get("event_type", ""),
+        "risk_score": event_data.get("risk_score", 0.0),
+        "head_status": event_data.get("head_status"),
+        "alert_threshold": event_data.get("alert_threshold"),
+        "details": event_data.get("details"),
+    }
+    url = f"{cfg.supabase_url.rstrip('/')}/rest/v1/event_logs"
+    body = json.dumps(row).encode("utf-8")
+    req = Request(url, data=body, headers={
+        "Content-Type": "application/json",
+        "apikey": cfg.supabase_anon_key,
+        "Authorization": f"Bearer {cfg.supabase_anon_key}",
+        "Prefer": "return=minimal",
+    }, method="POST")
+    try:
+        with urlopen(req, timeout=3.0):
+            pass
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        print(f"[Supabase] POST event_logs failed: {exc}")
+
+
+def post_student_reports_supabase(cfg: "RuntimeConfig", student_history: Dict[int, Dict[str, Any]]) -> None:
+    if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
+        return
+    rows = []
+    for sid in sorted(student_history.keys()):
+        hist = student_history[sid]
+        samples = int(hist.get("samples", 0))
+        avg_risk = (float(hist.get("risk_sum", 0.0)) / samples) if samples > 0 else 0.0
+        rows.append({
+            "session_id": cfg.session_id,
+            "student_id": str(sid),
+            "samples": samples,
+            "avg_risk": round(avg_risk, 4),
+            "max_risk": round(float(hist.get("risk_max", 0.0)), 4),
+            "final_label": str(hist.get("final_label", "NORMAL")),
+            "image_url": hist.get("image_url"),
+            "image_captured_at_ms": hist.get("image_captured_at_ms"),
+        })
+    if not rows:
+        return
+    url = f"{cfg.supabase_url.rstrip('/')}/rest/v1/student_reports"
+    body = json.dumps(rows).encode("utf-8")
+    req = Request(url, data=body, headers={
+        "Content-Type": "application/json",
+        "apikey": cfg.supabase_anon_key,
+        "Authorization": f"Bearer {cfg.supabase_anon_key}",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+    }, method="POST")
+    try:
+        with urlopen(req, timeout=10.0):
+            print(f"[Supabase] student_reports saved: {len(rows)} students")
+    except HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace")
+        print(f"[Supabase] POST student_reports HTTP {exc.code}: {err}")
+    except (URLError, TimeoutError, OSError) as exc:
+        print(f"[Supabase] POST student_reports failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1543,6 +1644,7 @@ def maybe_capture_snapshot(
     tracked_students: Dict[Union[int, str], Dict[str, Any]],
     student_history: Dict[int, Dict[str, Any]],
     report_image_dir: str,
+    cfg=None,
 ) -> None:
     os.makedirs(report_image_dir, exist_ok=True)
     frame_h, frame_w = frame.shape[:2]
@@ -1573,6 +1675,12 @@ def maybe_capture_snapshot(
         hist["best_image_risk"] = current_risk
         hist["image_path"] = image_path
         hist["image_captured_at_ms"] = ts_ms
+        if cfg is not None:
+            def _upload():
+                image_url = upload_student_image_supabase(cfg, int_sid, image_path)
+                if image_url:
+                    hist["image_url"] = image_url
+            threading.Thread(target=_upload, daemon=True).start()
 
 
 def handle_events_and_alerts(
@@ -1601,6 +1709,7 @@ def handle_events_and_alerts(
                 current_head,
                 cfg.alert_threshold,
                 "transition=forward_to_non_forward",
+                cfg,
             )
 
         previous_contraband = float(hist.get("last_contraband_risk", 0.0))
@@ -1615,6 +1724,7 @@ def handle_events_and_alerts(
                 current_head,
                 cfg.alert_threshold,
                 f"contraband_risk={current_contraband:.2f}",
+                cfg,
             )
 
         risk = float(info["risk"])
@@ -1636,6 +1746,7 @@ def handle_events_and_alerts(
                     current_head,
                     cfg.alert_threshold,
                     "threshold_crossed=true",
+                    cfg,
                 )
                 payload = {
                     "event_type": "alert_high_risk_triggered",
@@ -1666,6 +1777,7 @@ def handle_events_and_alerts(
                 current_head,
                 cfg.alert_threshold,
                 "threshold_cleared=true",
+                cfg,
             )
             hist["above_threshold"] = False
 
@@ -1800,8 +1912,16 @@ def _run_session(cfg: RuntimeConfig, session_id: str) -> None:
             )
 
             update_student_report_stats(tracked_students, student_history)
-            maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir)
+            maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir, cfg)
             handle_events_and_alerts(frame_index, tracked_students, student_history, event_log, cfg)
+
+            # Live upsert to student_reports every ~5 s so the dashboard sees current data
+            if frame_index % 150 == 0 and student_history:
+                threading.Thread(
+                    target=post_student_reports_supabase,
+                    args=(cfg, student_history),
+                    daemon=True,
+                ).start()
 
             # Push frame to WebRTC sender
             if webrtc_thread is not None:
@@ -1838,6 +1958,7 @@ def _run_session(cfg: RuntimeConfig, session_id: str) -> None:
 
     print_exam_summary(student_history)
     write_report_csv(cfg.report_csv, student_history)
+    post_student_reports_supabase(cfg, student_history)
     print(f"[Session] Report written: {cfg.report_csv}")
     print(f"[Session] Session {session_id} ended. Returning to standby…\n")
 
@@ -1888,8 +2009,14 @@ def main() -> None:
                     pose_cache, contraband_cache, student_history,
                 )
                 update_student_report_stats(tracked_students, student_history)
-                maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir)
+                maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir, cfg)
                 handle_events_and_alerts(frame_index, tracked_students, student_history, event_log, cfg)
+                if frame_index % 150 == 0 and student_history:
+                    threading.Thread(
+                        target=post_student_reports_supabase,
+                        args=(cfg, student_history),
+                        daemon=True,
+                    ).start()
                 if cfg.headless and (frame_index % cfg.status_every_frames == 0):
                     max_risk = max((float(s["risk"]) for s in tracked_students.values()), default=0.0)
                     print(f"status frame={frame_index} tracked_students={len(tracked_students)} max_risk={max_risk:.2f}")
@@ -1904,6 +2031,7 @@ def main() -> None:
             cv2.destroyAllWindows()
         print_exam_summary(student_history)
         write_report_csv(cfg.report_csv, student_history)
+        post_student_reports_supabase(cfg, student_history)
         return
 
     # ── GuardEye mode: standby loop ─────────────────────────────────────────
