@@ -1,2 +1,0 @@
-event_ts_iso,event_ts_ms,frame_index,student_id,event_type,risk_score,head_status,alert_threshold,details
-2026-05-11T19:48:58.444189+00:00,1778528938444,208,6,head_pose_warning,0.2500,Looking Down!,0.75,transition=forward_to_non_forward

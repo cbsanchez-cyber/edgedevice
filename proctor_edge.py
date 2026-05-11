@@ -1890,6 +1890,7 @@ def _run_session(cfg: RuntimeConfig, session_id: str) -> None:
     pose_cache: List[Dict[str, Any]] = []
     contraband_cache: List[Dict[str, Any]] = []
     student_history: Dict[int, Dict[str, Any]] = {}
+    last_report_push = 0.0
 
     print(f"[Session] Camera open. Detection running. Streaming to GuardEye…")
 
@@ -1912,16 +1913,16 @@ def _run_session(cfg: RuntimeConfig, session_id: str) -> None:
             )
 
             update_student_report_stats(tracked_students, student_history)
-            maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir, cfg)
-            handle_events_and_alerts(frame_index, tracked_students, student_history, event_log, cfg)
-
-            # Live upsert to student_reports every ~5 s so the dashboard sees current data
-            if frame_index % 150 == 0 and student_history:
+            now_ts = time.time()
+            if now_ts - last_report_push >= 10.0 and student_history:
                 threading.Thread(
                     target=post_student_reports_supabase,
-                    args=(cfg, student_history),
+                    args=(cfg, dict(student_history)),
                     daemon=True,
                 ).start()
+                last_report_push = now_ts
+            maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir, cfg)
+            handle_events_and_alerts(frame_index, tracked_students, student_history, event_log, cfg)
 
             # Push frame to WebRTC sender
             if webrtc_thread is not None:
