@@ -86,10 +86,11 @@ COLOR_YELLOW = (0, 255, 255)
 COLOR_CYAN = (255, 255, 0)
 
 EVENT_HEADER = [
+    "session_id",
+    "student_id",
     "event_ts_iso",
     "event_ts_ms",
     "frame_index",
-    "student_id",
     "event_type",
     "risk_score",
     "head_status",
@@ -98,12 +99,13 @@ EVENT_HEADER = [
 ]
 
 REPORT_HEADER = [
+    "session_id",
     "student_id",
     "samples",
     "avg_risk",
     "max_risk",
     "final_label",
-    "image_path",
+    "image_url",
     "image_captured_at_ms",
 ]
 
@@ -142,6 +144,7 @@ class RuntimeConfig:
     supabase_url: Optional[str] = None       # e.g. https://xxxx.supabase.co
     supabase_anon_key: Optional[str] = None  # project anon/public key
     session_id: Optional[str] = None         # GuardEye session UUID
+    user_id: Optional[str] = None            # auth.uid() of the session owner
     webrtc_enabled: bool = False             # stream annotated video via WebRTC
     device_id: str = "pi-edge-001"           # shown in Hardware Connection dialog
 
@@ -685,27 +688,23 @@ def log_event(
     cfg=None,
 ) -> None:
     ts_ms, ts_iso = now_ms_iso()
+    session_id = cfg.session_id if cfg else ""
+    event_data = {
+        "session_id": session_id or "",
+        "student_id": str(student_id),
+        "event_ts_iso": ts_iso,
+        "event_ts_ms": ts_ms,
+        "frame_index": frame_index,
+        "event_type": event_type,
+        "risk_score": round(float(risk_score), 4),
+        "head_status": head_status,
+        "alert_threshold": round(float(alert_threshold), 4),
+        "details": details,
+    }
     if handle is not None:
-        handle.writer.writerow(
-            [
-                ts_iso,
-                ts_ms,
-                frame_index,
-                student_id,
-                event_type,
-                f"{risk_score:.4f}",
-                head_status,
-                f"{alert_threshold:.2f}",
-                details,
-            ]
-        )
+        handle.writer.writerow([event_data.get(col, "") for col in EVENT_HEADER])
         handle.fh.flush()
     if cfg is not None:
-        event_data = {
-            "student_id": student_id, "event_ts_iso": ts_iso, "event_ts_ms": ts_ms,
-            "frame_index": frame_index, "event_type": event_type, "risk_score": risk_score,
-            "head_status": head_status, "alert_threshold": alert_threshold, "details": details,
-        }
         threading.Thread(target=post_event_log_supabase, args=(cfg, event_data), daemon=True).start()
 
 
@@ -725,6 +724,38 @@ def post_alert(endpoint: Optional[str], payload: Dict[str, Any]) -> None:
             pass
     except (URLError, TimeoutError, OSError) as exc:
         print(f"Alert POST failed: {exc}")
+
+
+def fetch_session_user_id(cfg: "RuntimeConfig") -> Optional[str]:
+    """
+    Look up the user_id that owns cfg.session_id from the Supabase sessions table.
+    Returns the UUID string, or None on any failure.
+    """
+    if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
+        return None
+    url = (
+        f"{cfg.supabase_url.rstrip('/')}/rest/v1/sessions"
+        f"?id=eq.{cfg.session_id}&select=user_id&limit=1"
+    )
+    req = Request(url, headers={
+        "apikey": cfg.supabase_anon_key,
+        "Authorization": f"Bearer {cfg.supabase_anon_key}",
+        "Accept": "application/json",
+    })
+    try:
+        with urlopen(req, timeout=5.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data:
+                uid = data[0].get("user_id")
+                print(f"[Supabase] Session owner user_id: {uid}")
+                return uid
+            print("[Supabase] sessions query returned no rows for this session_id.")
+    except HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace")
+        print(f"[Supabase] GET sessions → HTTP {exc.code}: {err}")
+    except (URLError, TimeoutError, OSError) as exc:
+        print(f"[Supabase] GET sessions failed: {exc}")
+    return None
 
 
 def post_alert_supabase(cfg: "RuntimeConfig", payload: Dict[str, Any]) -> None:
@@ -750,6 +781,8 @@ def post_alert_supabase(cfg: "RuntimeConfig", payload: Dict[str, Any]) -> None:
         "riskScore": payload.get("risk_score", 0.0),
         "alertThreshold": payload.get("alert_threshold", cfg.alert_threshold),
     }
+    if cfg.user_id:
+        row["user_id"] = cfg.user_id
     # Only include optional fields when they have a value
     for key, src in (("headStatus", "head_status"), ("frameIndex", "frame_index"),
                      ("details", "details"), ("frameUrl", "frameUrl")):
@@ -809,16 +842,13 @@ def upload_student_image_supabase(cfg: "RuntimeConfig", student_id: int, image_p
 def post_event_log_supabase(cfg: "RuntimeConfig", event_data: Dict[str, Any]) -> None:
     if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
         return
+    # Post exactly the same fields that were written to the CSV — single source of truth
     row: Dict[str, Any] = {
-        "session_id": cfg.session_id,
-        "student_id": str(event_data.get("student_id", "")),
-        "event_type": event_data.get("event_type", ""),
-        "risk_score": event_data.get("risk_score", 0.0),
+        key: event_data[key]
+        for key in EVENT_HEADER
+        if event_data.get(key) not in (None, "")
     }
-    for key in ("event_ts_iso", "event_ts_ms", "frame_index", "head_status", "alert_threshold", "details"):
-        val = event_data.get(key)
-        if val is not None:
-            row[key] = val
+    row["session_id"] = cfg.session_id  # always use the authoritative session_id from cfg
     url = f"{cfg.supabase_url.rstrip('/')}/rest/v1/event_logs"
     body = json.dumps(row).encode("utf-8")
     req = Request(url, data=body, headers={
@@ -837,16 +867,18 @@ def post_event_log_supabase(cfg: "RuntimeConfig", event_data: Dict[str, Any]) ->
         print(f"[Supabase] POST event_logs failed: {exc}")
 
 
-def post_student_reports_supabase(cfg: "RuntimeConfig", student_history: Dict[int, Dict[str, Any]]) -> None:
-    if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
-        return
+def _build_student_report_rows(
+    session_id: str,
+    student_history: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Single source of truth for student report data used by both CSV and Supabase."""
     rows = []
     for sid in sorted(student_history.keys()):
         hist = student_history[sid]
         samples = int(hist.get("samples", 0))
         avg_risk = (float(hist.get("risk_sum", 0.0)) / samples) if samples > 0 else 0.0
         row: Dict[str, Any] = {
-            "session_id": cfg.session_id,
+            "session_id": session_id,
             "student_id": str(sid),
             "samples": samples,
             "avg_risk": round(avg_risk, 4),
@@ -858,6 +890,13 @@ def post_student_reports_supabase(cfg: "RuntimeConfig", student_history: Dict[in
             if val is not None:
                 row[key] = val
         rows.append(row)
+    return rows
+
+
+def post_student_reports_supabase(cfg: "RuntimeConfig", student_history: Dict[int, Dict[str, Any]]) -> None:
+    if not cfg.supabase_url or not cfg.supabase_anon_key or not cfg.session_id:
+        return
+    rows = _build_student_report_rows(cfg.session_id, student_history)
     if not rows:
         return
     url = f"{cfg.supabase_url.rstrip('/')}/rest/v1/student_reports"
@@ -1816,32 +1855,15 @@ def print_exam_summary(student_history: Dict[int, Dict[str, Any]]) -> None:
         )
 
 
-def write_report_csv(path: str, student_history: Dict[int, Dict[str, Any]]) -> None:
+def write_report_csv(path: str, student_history: Dict[int, Dict[str, Any]], cfg: Optional["RuntimeConfig"] = None) -> None:
     ensure_parent_dir(path)
+    session_id = (cfg.session_id if cfg else None) or ""
+    rows = _build_student_report_rows(session_id, student_history)
     with open(path, mode="w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(REPORT_HEADER)
-
-        for sid in sorted(student_history.keys()):
-            hist = student_history[sid]
-            samples = int(hist.get("samples", 0))
-            avg_risk = (float(hist.get("risk_sum", 0.0)) / samples) if samples > 0 else 0.0
-            max_risk = float(hist.get("risk_max", 0.0))
-            final_label = str(hist.get("final_label", "Normal"))
-            image_path = str(hist.get("image_path", ""))
-            image_captured_at_ms = hist.get("image_captured_at_ms", "")
-
-            writer.writerow(
-                [
-                    sid,
-                    samples,
-                    f"{avg_risk:.4f}",
-                    f"{max_risk:.4f}",
-                    final_label,
-                    image_path,
-                    image_captured_at_ms,
-                ]
-            )
+        for row in rows:
+            writer.writerow([row.get(col, "") for col in REPORT_HEADER])
 
 
 def _run_session(cfg: RuntimeConfig, session_id: str) -> None:
@@ -1925,16 +1947,24 @@ def _run_session(cfg: RuntimeConfig, session_id: str) -> None:
             )
 
             update_student_report_stats(tracked_students, student_history)
+            maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir, cfg)
+            _prev_above = {sid: h.get("above_threshold", False) for sid, h in student_history.items()}
+            handle_events_and_alerts(frame_index, tracked_students, student_history, event_log, cfg)
+            _alert_fired = any(
+                student_history.get(sid, {}).get("above_threshold") != prev
+                for sid, prev in _prev_above.items()
+            )
             now_ts = time.time()
-            if now_ts - last_report_push >= 10.0 and student_history:
+            if student_history and (
+                now_ts - last_report_push >= 3.0
+                or (_alert_fired and now_ts - last_report_push >= 0.5)
+            ):
                 threading.Thread(
                     target=post_student_reports_supabase,
                     args=(cfg, dict(student_history)),
                     daemon=True,
                 ).start()
                 last_report_push = now_ts
-            maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir, cfg)
-            handle_events_and_alerts(frame_index, tracked_students, student_history, event_log, cfg)
 
             # Push frame to WebRTC sender
             if webrtc_thread is not None:
@@ -1970,7 +2000,7 @@ def _run_session(cfg: RuntimeConfig, session_id: str) -> None:
             webrtc_thread.join(timeout=5.0)
 
     print_exam_summary(student_history)
-    write_report_csv(cfg.report_csv, student_history)
+    write_report_csv(cfg.report_csv, student_history, cfg)
     post_student_reports_supabase(cfg, student_history)
     print(f"[Session] Report written: {cfg.report_csv}")
     print(f"[Session] Session {session_id} ended. Returning to standby…\n")
@@ -2009,6 +2039,7 @@ def main() -> None:
         pose_cache: List[Dict[str, Any]] = []
         contraband_cache: List[Dict[str, Any]] = []
         student_history: Dict[int, Dict[str, Any]] = {}
+        last_report_push = 0.0
         try:
             while True:
                 ok, frame = cap.read()
@@ -2023,13 +2054,23 @@ def main() -> None:
                 )
                 update_student_report_stats(tracked_students, student_history)
                 maybe_capture_snapshot(frame, tracked_students, student_history, cfg.report_image_dir, cfg)
+                _prev_above = {sid: h.get("above_threshold", False) for sid, h in student_history.items()}
                 handle_events_and_alerts(frame_index, tracked_students, student_history, event_log, cfg)
-                if frame_index % 150 == 0 and student_history:
+                _alert_fired = any(
+                    student_history.get(sid, {}).get("above_threshold") != prev
+                    for sid, prev in _prev_above.items()
+                )
+                now_ts = time.time()
+                if student_history and (
+                    now_ts - last_report_push >= 3.0
+                    or (_alert_fired and now_ts - last_report_push >= 0.5)
+                ):
                     threading.Thread(
                         target=post_student_reports_supabase,
-                        args=(cfg, student_history),
+                        args=(cfg, dict(student_history)),
                         daemon=True,
                     ).start()
+                    last_report_push = now_ts
                 if cfg.headless and (frame_index % cfg.status_every_frames == 0):
                     max_risk = max((float(s["risk"]) for s in tracked_students.values()), default=0.0)
                     print(f"status frame={frame_index} tracked_students={len(tracked_students)} max_risk={max_risk:.2f}")
@@ -2043,7 +2084,7 @@ def main() -> None:
             close_event_log(event_log)
             cv2.destroyAllWindows()
         print_exam_summary(student_history)
-        write_report_csv(cfg.report_csv, student_history)
+        write_report_csv(cfg.report_csv, student_history, cfg)
         post_student_reports_supabase(cfg, student_history)
         return
 
@@ -2074,6 +2115,7 @@ def main() -> None:
             continue
 
         cfg.session_id = session_id
+        cfg.user_id = fetch_session_user_id(cfg)
 
         # Phase 2: wait for browser to open Live Monitoring page
         # Camera and AI do NOT start until the browser is actually watching
@@ -2084,6 +2126,7 @@ def main() -> None:
         if not browser_ready:
             print("[Standby] Browser never opened. Returning to standby.")
             cfg.session_id = None
+            cfg.user_id = None
             continue
 
         # Phase 3: browser is live — start camera + AI + WebRTC streaming
@@ -2091,6 +2134,7 @@ def main() -> None:
 
         # Session ended — clear session_id and go back to standby
         cfg.session_id = None
+        cfg.user_id = None
         print("[Standby] Ready for next session.")
         print(f"  Enter Device ID  \"{cfg.device_id}\"  in GuardEye to start again.")
         print("")
