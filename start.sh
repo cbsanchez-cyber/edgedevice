@@ -32,7 +32,7 @@ echo "Starting GuardEye edge device..."
 echo "Device ID: ${GUARDEYE_DEVICE_ID:-pi-edge-001}"
 echo ""
 
-python proctor_edge.py \
+./venv/bin/python proctor_edge.py \
     --source pi \
     --raspi \
     --headless \

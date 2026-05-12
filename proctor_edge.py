@@ -179,7 +179,13 @@ class Picamera2CaptureWrapper:
 
         config = self._cam.create_preview_configuration(
             main={"size": (width, height), "format": "RGB888"},
-            controls={"FrameRate": float(fps)},
+            controls={
+                "FrameRate": float(fps),
+                "NoiseReductionMode": 2,   # HighQuality
+                "Sharpness": 1.5,
+                "AwbEnable": True,
+                "AeEnable": True,
+            },
         )
         self._cam.configure(config)
         self._cam.start()
@@ -341,13 +347,13 @@ def parse_args() -> RuntimeConfig:
     if raspi_mode:
         # Camera Module 3 Wide is naturally wide FOV; default to 16:9 output if user kept defaults.
         if args.width == 640 and args.height == 480:
-            width = 640
-            height = 360
+            width = 1280
+            height = 720
         else:
-            width = min(width, 640)
-            height = min(height, 480)
-        det_imgsz = min(det_imgsz, 512)
-        pose_imgsz = min(pose_imgsz, 512)
+            width = min(width, 1280)
+            height = min(height, 720)
+        det_imgsz = min(det_imgsz, 640)
+        pose_imgsz = min(pose_imgsz, 640)
         pose_interval = max(2, pose_interval)
         contraband_interval = max(2, contraband_interval)
         if args.frame_fit == "stretch":
@@ -396,8 +402,12 @@ def fit_frame(frame: np.ndarray, target_w: int, target_h: int, mode: str) -> np.
     if src_w <= 0 or src_h <= 0:
         return frame
 
+    def _interp(src_pixels: int, dst_pixels: int) -> int:
+        return cv2.INTER_AREA if dst_pixels < src_pixels else cv2.INTER_CUBIC
+
     if mode == "stretch":
-        return cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        interp = _interp(src_w * src_h, target_w * target_h)
+        return cv2.resize(frame, (target_w, target_h), interpolation=interp)
 
     src_aspect = src_w / src_h
     target_aspect = target_w / target_h
@@ -410,7 +420,8 @@ def fit_frame(frame: np.ndarray, target_w: int, target_h: int, mode: str) -> np.
             new_h = target_h
             new_w = int(target_h * src_aspect)
 
-        resized = cv2.resize(frame, (max(1, new_w), max(1, new_h)), interpolation=cv2.INTER_LINEAR)
+        interp = _interp(src_w * src_h, new_w * new_h)
+        resized = cv2.resize(frame, (max(1, new_w), max(1, new_h)), interpolation=interp)
         canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
         x_off = (target_w - new_w) // 2
         y_off = (target_h - new_h) // 2
@@ -425,7 +436,8 @@ def fit_frame(frame: np.ndarray, target_w: int, target_h: int, mode: str) -> np.
         new_w = target_w
         new_h = int(target_w / src_aspect)
 
-    resized = cv2.resize(frame, (max(1, new_w), max(1, new_h)), interpolation=cv2.INTER_LINEAR)
+    interp = _interp(src_w * src_h, new_w * new_h)
+    resized = cv2.resize(frame, (max(1, new_w), max(1, new_h)), interpolation=interp)
     x_off = (new_w - target_w) // 2
     y_off = (new_h - target_h) // 2
     return resized[y_off : y_off + target_h, x_off : x_off + target_w]
@@ -1251,7 +1263,7 @@ async def _wait_for_browser_ready(cfg: "RuntimeConfig") -> bool:
         + f"/realtime/v1/websocket?apikey={cfg.supabase_anon_key}&vsn=1.0.0"
     )
     channel_topic = f"realtime:webrtc_{cfg.session_id}"
-    deadline = asyncio.get_event_loop().time() + 120  # 2-minute timeout
+    deadline = asyncio.get_running_loop().time() + 120  # 2-minute timeout
 
     print(f"[Device] Waiting for browser to open Live Monitoring… (2 min timeout)")
 
@@ -1718,7 +1730,7 @@ def maybe_capture_snapshot(
             continue
 
         image_path = os.path.join(report_image_dir, f"student_{int_sid}.jpg")
-        saved = cv2.imwrite(image_path, crop)
+        saved = cv2.imwrite(image_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
         if not saved:
             continue
 
@@ -1917,7 +1929,7 @@ def _run_session(cfg: RuntimeConfig, session_id: str) -> None:
     # WebRTC frame queue — started fresh each session
     webrtc_stop = threading.Event()
     session_stop = threading.Event()   # set by WebRTC sender when browser disconnects
-    frame_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)
+    frame_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=6)
     webrtc_thread = start_webrtc_thread(cfg, frame_queue, webrtc_stop, session_stop)
 
     frame_index = 0
